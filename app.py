@@ -13,7 +13,7 @@ BASE_DOMAIN = os.getenv("BASE_DOMAIN", "https://omantracking2.com")
 TOKEN = os.getenv("TOKEN")  # Render Env Variable
 DB_FILE = "reports.db"
 
-# Google Drive setup
+# C-Google Drive setup
 SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "service_account.json")
 FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")  # Your Drive folder
 
