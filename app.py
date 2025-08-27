@@ -1,29 +1,19 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 import requests
 import sqlite3
 from datetime import datetime
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
-import io
 import os
+import uuid
 
 # ---------------- CONFIG ----------------
 BASE_DOMAIN = os.getenv("BASE_DOMAIN", "https://omantracking2.com")
 TOKEN = os.getenv("TOKEN")  # Render Env Variable
 DB_FILE = "reports.db"
+STORAGE_PATH = os.getenv("STORAGE_PATH", "/opt/render/reports")  # Render persistent disk
 
-# C-Google Drive setup
-SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "service_account.json")
-FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")  # Your Drive folder
-
-credentials = service_account.Credentials.from_service_account_file(
-    SERVICE_ACCOUNT_FILE,
-    scopes=["https://www.googleapis.com/auth/drive.file"]
-)
-drive_service = build("drive", "v3", credentials=credentials)
+# Create storage directory if it doesn't exist
+os.makedirs(STORAGE_PATH, exist_ok=True)
 # -----------------------------------------
-
 
 # --- Database functions ---
 def init_db():
@@ -34,12 +24,12 @@ def init_db():
         (
             render_id INTEGER PRIMARY KEY,
             output_file TEXT,
+            file_path TEXT,
             downloaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.commit()
     conn.close()
-
 
 def already_downloaded(rid):
     conn = sqlite3.connect(DB_FILE)
@@ -49,36 +39,25 @@ def already_downloaded(rid):
     conn.close()
     return exists
 
-
-def save_to_db(rid, file_url):
+def save_to_db(rid, file_url, file_path):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute(
-        "INSERT OR IGNORE INTO downloaded_reports (render_id, output_file) VALUES (?, ?)",
-        (rid, file_url)
+        "INSERT OR IGNORE INTO downloaded_reports (render_id, output_file, file_path) VALUES (?, ?, ?)",
+        (rid, file_url, file_path)
     )
     conn.commit()
     conn.close()
 
-
-# --- Google Drive upload ---
-def upload_to_drive(file_bytes, file_name):
-    file_metadata = {
-        "name": file_name,
-        "parents": [FOLDER_ID]
-    }
-    media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype="text/csv")
-    uploaded_file = drive_service.files().create(
-        body=file_metadata,
-        media_body=media,
-        fields="id, webViewLink"
-    ).execute()
-    return uploaded_file["webViewLink"]
-
+# --- Local file storage ---
+def save_file_locally(file_bytes, file_name):
+    file_path = os.path.join(STORAGE_PATH, file_name)
+    with open(file_path, 'wb') as f:
+        f.write(file_bytes)
+    return file_path
 
 # --- Flask API ---
 app = Flask(__name__)
-
 
 @app.route("/get_report", methods=["GET"])
 def get_report():
@@ -110,7 +89,22 @@ def get_report():
         return jsonify({"error": "No report file info found"}), 404
 
     if already_downloaded(rid):
-        return jsonify({"message": "Report already processed", "render_id": rid})
+        # Get the stored file path
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.cursor()
+        cur.execute("SELECT file_path FROM downloaded_reports WHERE render_id=?", (rid,))
+        result = cur.fetchone()
+        conn.close()
+        
+        if result:
+            file_path = result[0]
+            file_name = os.path.basename(file_path)
+            return jsonify({
+                "message": "Report already processed", 
+                "render_id": rid,
+                "download_url": f"/download_file/{file_name}",
+                "file_path": file_path
+            })
 
     if is_ready:
         file_url = f"{BASE_DOMAIN}{output_file}"
@@ -118,16 +112,18 @@ def get_report():
         if csv_resp.status_code != 200:
             return jsonify({"error": f"Failed to fetch CSV {csv_resp.status_code}"}), csv_resp.status_code
 
-        # Name: appid-reportid-renderid-date.csv
-        file_name = f"{application_id}-{report_id}-{render_id}-{datetime.now().strftime('%Y%m%d')}.csv"
-        cloud_url = upload_to_drive(csv_resp.content, file_name)
-        save_to_db(rid, cloud_url)
+        # Generate unique filename
+        file_name = f"{application_id}-{report_id}-{render_id}-{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        file_path = save_file_locally(csv_resp.content, file_name)
+        save_to_db(rid, file_url, file_path)
 
         return jsonify({
             "application_id": application_id,
             "report_id": report_id,
             "render_id": render_id,
-            "csv_url": cloud_url
+            "download_url": f"/download_file/{file_name}",
+            "file_path": file_path,
+            "message": "File saved successfully"
         })
 
     return jsonify({"message": "Report not ready yet",
@@ -135,6 +131,17 @@ def get_report():
                     "report_id": report_id,
                     "render_id": render_id})
 
+@app.route("/download_file/<filename>", methods=["GET"])
+def download_file(filename):
+    file_path = os.path.join(STORAGE_PATH, filename)
+    if os.path.exists(file_path):
+        return send_file(file_path, as_attachment=True, download_name=filename)
+    return jsonify({"error": "File not found"}), 404
+
+@app.route("/list_files", methods=["GET"])
+def list_files():
+    files = os.listdir(STORAGE_PATH)
+    return jsonify({"files": files, "count": len(files)})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
