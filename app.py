@@ -3,7 +3,6 @@ import requests
 import sqlite3
 from datetime import datetime
 import os
-import uuid
 
 # ---------------- CONFIG ----------------
 BASE_DOMAIN = os.getenv("BASE_DOMAIN", "https://omantracking2.com")
@@ -23,7 +22,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS downloaded_reports
         (
             render_id INTEGER PRIMARY KEY,
-            output_file TEXT,
+            file_name TEXT,
             file_path TEXT,
             downloaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
@@ -34,17 +33,17 @@ def init_db():
 def already_downloaded(rid):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    cur.execute("SELECT 1 FROM downloaded_reports WHERE render_id=?", (rid,))
-    exists = cur.fetchone() is not None
+    cur.execute("SELECT file_name FROM downloaded_reports WHERE render_id=?", (rid,))
+    result = cur.fetchone()
     conn.close()
-    return exists
+    return result[0] if result else None
 
-def save_to_db(rid, file_url, file_path):
+def save_to_db(rid, file_name, file_path):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute(
-        "INSERT OR IGNORE INTO downloaded_reports (render_id, output_file, file_path) VALUES (?, ?, ?)",
-        (rid, file_url, file_path)
+        "INSERT OR REPLACE INTO downloaded_reports (render_id, file_name, file_path) VALUES (?, ?, ?)",
+        (rid, file_name, file_path)
     )
     conn.commit()
     conn.close()
@@ -88,23 +87,15 @@ def get_report():
     if not rid or not output_file:
         return jsonify({"error": "No report file info found"}), 404
 
-    if already_downloaded(rid):
-        # Get the stored file path
-        conn = sqlite3.connect(DB_FILE)
-        cur = conn.cursor()
-        cur.execute("SELECT file_path FROM downloaded_reports WHERE render_id=?", (rid,))
-        result = cur.fetchone()
-        conn.close()
-        
-        if result:
-            file_path = result[0]
-            file_name = os.path.basename(file_path)
-            return jsonify({
-                "message": "Report already processed", 
-                "render_id": rid,
-                "download_url": f"/download_file/{file_name}",
-                "file_path": file_path
-            })
+    # Check if already downloaded and return the download link
+    existing_file = already_downloaded(rid)
+    if existing_file:
+        return jsonify({
+            "message": "Report already processed", 
+            "render_id": rid,
+            "download_url": f"/download_file/{existing_file}",
+            "file_name": existing_file
+        })
 
     if is_ready:
         file_url = f"{BASE_DOMAIN}{output_file}"
@@ -115,14 +106,14 @@ def get_report():
         # Generate unique filename
         file_name = f"{application_id}-{report_id}-{render_id}-{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         file_path = save_file_locally(csv_resp.content, file_name)
-        save_to_db(rid, file_url, file_path)
+        save_to_db(rid, file_name, file_path)
 
         return jsonify({
             "application_id": application_id,
             "report_id": report_id,
-            "render_id": render_id,
+            "render_id": rid,
             "download_url": f"/download_file/{file_name}",
-            "file_path": file_path,
+            "file_name": file_name,
             "message": "File saved successfully"
         })
 
