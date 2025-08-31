@@ -19,9 +19,29 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --- Flask API ---
-app = Flask(__name__)  # ← THIS MUST COME BEFORE @app.route DECORATORS!
+app = Flask(__name__)  # ✅ MUST be before routes!
 
 # --- Database functions ---
+def cleanup_invalid_records():
+    """Clean up any database records that point to non-existent files"""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT render_id, file_path FROM downloaded_reports")
+    records = cur.fetchall()
+    
+    deleted_count = 0
+    for rid, file_path in records:
+        if file_path and not os.path.exists(file_path):
+            # File doesn't exist - delete the record
+            cur.execute("DELETE FROM downloaded_reports WHERE render_id=?", (rid,))
+            deleted_count += 1
+    
+    conn.commit()
+    conn.close()
+    
+    if deleted_count > 0:
+        logger.info(f"Cleaned up {deleted_count} invalid database records")
+
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
@@ -29,21 +49,42 @@ def init_db():
         CREATE TABLE IF NOT EXISTS downloaded_reports
         (
             render_id INTEGER PRIMARY KEY,
-            file_name TEXT,
-            file_path TEXT,
+            file_name TEXT NOT NULL,  # ✅ Prevent null file names
+            file_path TEXT NOT NULL,   # ✅ Prevent null file paths
             downloaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    
+    # ✅ Clean up any existing invalid records
+    try:
+        cleanup_invalid_records()
+    except Exception as e:
+        logger.error(f"Cleanup error: {str(e)}")
+    
     conn.commit()
     conn.close()
 
 def already_downloaded(rid):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    cur.execute("SELECT file_name FROM downloaded_reports WHERE render_id=?", (rid,))
+    cur.execute("SELECT file_name, file_path FROM downloaded_reports WHERE render_id=?", (rid,))
     result = cur.fetchone()
     conn.close()
-    return result[0] if result else None
+    
+    # ✅ CRITICAL FIX: Check if record exists AND has valid file data
+    if result and result[0] and result[1]:  # file_name and file_path are not null/empty
+        # Additional check: verify the file actually exists on disk
+        if os.path.exists(result[1]):
+            return result[0]  # Return valid file name
+        else:
+            # File doesn't exist on disk - delete the invalid database record
+            conn = sqlite3.connect(DB_FILE)
+            cur = conn.cursor()
+            cur.execute("DELETE FROM downloaded_reports WHERE render_id=?", (rid,))
+            conn.commit()
+            conn.close()
+            return None
+    return None
 
 def save_to_db(rid, file_name, file_path):
     conn = sqlite3.connect(DB_FILE)
@@ -74,7 +115,7 @@ def get_report():
     if not application_id or not report_id or not render_id:
         return jsonify({"error": "application_id, report_id, and render_id are required"}), 400
 
-    # ✅ FIRST: Check if already successfully downloaded
+    # ✅ FIRST: Check if already successfully downloaded (with NULL protection)
     existing_file = already_downloaded(render_id)
     if existing_file:
         return jsonify({
@@ -171,6 +212,15 @@ def list_files():
 @app.route("/health", methods=["GET"])
 def health_check():
     return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
+
+@app.route("/admin/cleanup", methods=["POST"])
+def admin_cleanup():
+    """Manual cleanup endpoint for emergency fixes"""
+    try:
+        cleanup_invalid_records()
+        return jsonify({"message": "Database cleanup completed"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
