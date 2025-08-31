@@ -74,8 +74,8 @@ def get_report():
     if not application_id or not report_id or not render_id:
         return jsonify({"error": "application_id, report_id, and render_id are required"}), 400
 
-    # Build CORRECT API URL based on GPSGate documentation
-    url = f"{BASE_DOMAIN}/applications/{application_id}/reports/{report_id}/renderings/{render_id}"
+    # ✅ CORRECTED API URL - Uses the exact format we discovered works!
+    url = f"{BASE_DOMAIN}/comGpsGate/api/v.1/applications/{application_id}/reports/{report_id}/renderings/{render_id}"
     headers = {"Authorization": TOKEN, "Accept": "application/json"}
     
     logger.info(f"Calling GPSGate API: {url}")
@@ -112,11 +112,8 @@ def get_report():
             })
 
         if is_ready:
-            # Handle file download - check if outputFile is full URL or partial path
-            if output_file.startswith(('http://', 'https://')):
-                file_url = output_file
-            else:
-                file_url = f"{BASE_DOMAIN}{output_file}"
+            # ✅ Handle file download - outputFile is a partial path
+            file_url = f"{BASE_DOMAIN}{output_file}"
                 
             logger.info(f"Downloading report file from: {file_url}")
             
