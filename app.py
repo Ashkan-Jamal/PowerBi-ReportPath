@@ -23,15 +23,40 @@ logger = logging.getLogger(__name__)
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS downloaded_reports
-        (
-            render_id INTEGER PRIMARY KEY,
-            file_name TEXT,
-            file_path TEXT,
-            downloaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+    
+    # Check if table exists and has the correct schema
+    try:
+        cur.execute("PRAGMA table_info(downloaded_reports)")
+        columns = [column[1] for column in cur.fetchall()]
+        
+        # If table exists but missing file_name column, recreate it
+        if columns and 'file_name' not in columns:
+            logger.info("Old schema detected - recreating table")
+            cur.execute("DROP TABLE IF EXISTS downloaded_reports")
+            
+        # Create table with correct schema
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS downloaded_reports
+            (
+                render_id INTEGER PRIMARY KEY,
+                file_name TEXT,
+                file_path TEXT,
+                downloaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+    except sqlite3.OperationalError:
+        # Table doesn't exist, create it with correct schema
+        cur.execute("""
+            CREATE TABLE downloaded_reports
+            (
+                render_id INTEGER PRIMARY KEY,
+                file_name TEXT,
+                file_path TEXT,
+                downloaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+    
     conn.commit()
     conn.close()
 
@@ -65,7 +90,7 @@ app = Flask(__name__)
 
 @app.route("/get_report", methods=["GET"])
 def get_report():
-    init_db()
+    init_db()  # Ensure database schema is correct
 
     application_id = request.args.get("application_id")
     report_id = request.args.get("report_id")
