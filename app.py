@@ -3,6 +3,7 @@ import requests
 import sqlite3
 from datetime import datetime
 import os
+import logging
 
 # ---------------- CONFIG ----------------
 BASE_DOMAIN = os.getenv("BASE_DOMAIN", "https://omantracking2.com")
@@ -12,6 +13,10 @@ STORAGE_PATH = os.getenv("STORAGE_PATH", "/opt/render/reports")  # Render persis
 
 # Create storage directory if it doesn't exist
 os.makedirs(STORAGE_PATH, exist_ok=True)
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 # -----------------------------------------
 
 # --- Database functions ---
@@ -69,70 +74,108 @@ def get_report():
     if not application_id or not report_id or not render_id:
         return jsonify({"error": "application_id, report_id, and render_id are required"}), 400
 
-    # Build API URL dynamically
-    url = f"{BASE_DOMAIN}/comGpsGate/api/v.1/applications/{application_id}/reports/{report_id}/renderings/{render_id}"
+    # Build CORRECT API URL based on GPSGate documentation
+    url = f"{BASE_DOMAIN}/applications/{application_id}/reports/{report_id}/renderings/{render_id}"
     headers = {"Authorization": TOKEN, "Accept": "application/json"}
+    
+    logger.info(f"Calling GPSGate API: {url}")
 
     # Fetch report info
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        return jsonify({"error": f"Error fetching render info {response.status_code}",
-                        "details": response.text}), response.status_code
+    try:
+        response = requests.get(url, headers=headers, timeout=30)
+        logger.info(f"GPSGate API response status: {response.status_code}")
+        
+        if response.status_code != 200:
+            return jsonify({
+                "error": f"Error fetching render info {response.status_code}",
+                "details": response.text
+            }), response.status_code
 
-    data = response.json()
-    rid = data.get("id")
-    output_file = data.get("outputFile")
-    is_ready = data.get("isReady")
+        data = response.json()
+        logger.info(f"GPSGate API response data: {data}")
+        
+        rid = data.get("id")
+        output_file = data.get("outputFile")
+        is_ready = data.get("isReady")
 
-    if not rid or not output_file:
-        return jsonify({"error": "No report file info found"}), 404
+        if not rid or not output_file:
+            return jsonify({"error": "No report file info found in API response"}), 404
 
-    # Check if already downloaded and return the download link
-    existing_file = already_downloaded(rid)
-    if existing_file:
+        # Check if already downloaded and return the download link
+        existing_file = already_downloaded(rid)
+        if existing_file:
+            return jsonify({
+                "message": "Report already processed", 
+                "render_id": rid,
+                "download_url": f"/download_file/{existing_file}",
+                "file_name": existing_file
+            })
+
+        if is_ready:
+            # Handle file download - check if outputFile is full URL or partial path
+            if output_file.startswith(('http://', 'https://')):
+                file_url = output_file
+            else:
+                file_url = f"{BASE_DOMAIN}{output_file}"
+                
+            logger.info(f"Downloading report file from: {file_url}")
+            
+            csv_resp = requests.get(file_url, headers={"Authorization": TOKEN}, timeout=30)
+            if csv_resp.status_code != 200:
+                return jsonify({"error": f"Failed to fetch CSV {csv_resp.status_code}"}), csv_resp.status_code
+
+            # Generate unique filename
+            file_name = f"{application_id}-{report_id}-{render_id}-{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            file_path = save_file_locally(csv_resp.content, file_name)
+            save_to_db(rid, file_name, file_path)
+
+            return jsonify({
+                "application_id": application_id,
+                "report_id": report_id,
+                "render_id": rid,
+                "download_url": f"/download_file/{file_name}",
+                "file_name": file_name,
+                "message": "File saved successfully"
+            })
+
         return jsonify({
-            "message": "Report already processed", 
-            "render_id": rid,
-            "download_url": f"/download_file/{existing_file}",
-            "file_name": existing_file
-        })
-
-    if is_ready:
-        file_url = f"{BASE_DOMAIN}{output_file}"
-        csv_resp = requests.get(file_url, headers={"Authorization": TOKEN})
-        if csv_resp.status_code != 200:
-            return jsonify({"error": f"Failed to fetch CSV {csv_resp.status_code}"}), csv_resp.status_code
-
-        # Generate unique filename
-        file_name = f"{application_id}-{report_id}-{render_id}-{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        file_path = save_file_locally(csv_resp.content, file_name)
-        save_to_db(rid, file_name, file_path)
-
-        return jsonify({
+            "message": "Report not ready yet",
             "application_id": application_id,
             "report_id": report_id,
-            "render_id": rid,
-            "download_url": f"/download_file/{file_name}",
-            "file_name": file_name,
-            "message": "File saved successfully"
+            "render_id": render_id,
+            "status": "processing"
         })
 
-    return jsonify({"message": "Report not ready yet",
-                    "application_id": application_id,
-                    "report_id": report_id,
-                    "render_id": render_id})
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request error: {str(e)}")
+        return jsonify({"error": f"Network error: {str(e)}"}), 500
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
 @app.route("/download_file/<filename>", methods=["GET"])
 def download_file(filename):
-    file_path = os.path.join(STORAGE_PATH, filename)
-    if os.path.exists(file_path):
-        return send_file(file_path, as_attachment=True, download_name=filename)
-    return jsonify({"error": "File not found"}), 404
+    try:
+        file_path = os.path.join(STORAGE_PATH, filename)
+        if os.path.exists(file_path):
+            return send_file(file_path, as_attachment=True, download_name=filename)
+        return jsonify({"error": "File not found"}), 404
+    except Exception as e:
+        logger.error(f"Download error: {str(e)}")
+        return jsonify({"error": f"Download failed: {str(e)}"}), 500
 
 @app.route("/list_files", methods=["GET"])
 def list_files():
-    files = os.listdir(STORAGE_PATH)
-    return jsonify({"files": files, "count": len(files)})
+    try:
+        files = os.listdir(STORAGE_PATH)
+        return jsonify({"files": files, "count": len(files)})
+    except Exception as e:
+        logger.error(f"List files error: {str(e)}")
+        return jsonify({"error": f"Failed to list files: {str(e)}"}), 500
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
