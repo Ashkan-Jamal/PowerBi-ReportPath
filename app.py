@@ -11,6 +11,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from googleapiclient.errors import HttpError
 import io
+import re
 
 # ---------------- CONFIG ----------------
 BASE_DOMAIN = os.getenv("BASE_DOMAIN", "https://omantracking2.com")
@@ -41,7 +42,10 @@ def get_gdrive_service():
         if not credentials_json:
             logger.error("GDRIVE_CREDENTIALS environment variable not set")
             return None
-            
+        
+        # Fix escaped newlines in private key
+        credentials_json = credentials_json.replace('\\n', '\n')
+        
         # Parse the JSON string
         creds_dict = json.loads(credentials_json)
         
@@ -52,7 +56,7 @@ def get_gdrive_service():
         service = build('drive', 'v3', credentials=creds)
         return service
     except Exception as e:
-        logger.exception("Error creating Google Drive service")
+        logger.exception(f"Error creating Google Drive service: {str(e)}")
         return None
 
 def save_to_gdrive(file_url, file_name):
@@ -105,21 +109,9 @@ def save_to_gdrive(file_url, file_name):
 # --- Database functions ---
 def cleanup_invalid_records():
     """Clean up any database records that point to non-existent files."""
-    deleted_count = 0
     try:
-        with sqlite3.connect(DB_FILE) as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT render_id, file_path FROM downloaded_reports")
-            records = cur.fetchall()
-
-            for rid, file_path in records:
-                # For Google Drive links, we can't check if file exists remotely
-                # So we'll just keep them in the database
-                pass
-
-            conn.commit()
-
-        logger.info("Database cleanup completed")
+        # For Google Drive, we don't need to check file existence
+        logger.info("Database cleanup completed (Google Drive mode)")
     except Exception:
         logger.exception("Error during cleanup_invalid_records")
 
@@ -139,6 +131,17 @@ def init_db():
             cur = conn.cursor()
             logger.info("Ensuring 'downloaded_reports' table exists...")
             cur.execute(sql)
+            
+            # Check if we need to migrate old schema
+            cur.execute("PRAGMA table_info(downloaded_reports)")
+            columns = [col[1] for col in cur.fetchall()]
+            
+            if 'file_name' not in columns:
+                logger.info("Migrating database schema...")
+                # Backup old data if needed
+                cur.execute("ALTER TABLE downloaded_reports RENAME TO downloaded_reports_old")
+                cur.execute(sql)
+                
             conn.commit()
 
         cleanup_invalid_records()
@@ -155,6 +158,13 @@ def already_downloaded(rid):
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cur = conn.cursor()
+            # First check if the table has the right columns
+            cur.execute("PRAGMA table_info(downloaded_reports)")
+            columns = [col[1] for col in cur.fetchall()]
+            
+            if 'file_name' not in columns:
+                return None
+                
             cur.execute("SELECT file_name, file_path FROM downloaded_reports WHERE render_id=?", (rid,))
             result = cur.fetchone()
 
@@ -243,7 +253,7 @@ def get_report():
             file_path = save_file_locally(file_url, file_name)
 
             if not file_path:
-                return jsonify({"error": "Failed to save file"}), 500
+                return jsonify({"error": "Failed to save file to Google Drive"}), 500
 
             save_to_db(rid, file_name, file_path)
 
@@ -253,7 +263,7 @@ def get_report():
                 "render_id": rid,
                 "download_url": f"{request.host_url}download_file/{file_name}",
                 "file_name": file_name,
-                "message": "File saved successfully"
+                "message": "File saved successfully to Google Drive"
             })
 
         return jsonify({
@@ -310,7 +320,8 @@ def health_check():
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "db_file_exists": os.path.exists(DB_FILE),
-        "storage_count": len(os.listdir(STORAGE_PATH))
+        "gdrive_configured": bool(GDRIVE_CREDENTIALS),
+        "gdrive_folder_set": bool(GDRIVE_FOLDER_ID)
     })
 
 
