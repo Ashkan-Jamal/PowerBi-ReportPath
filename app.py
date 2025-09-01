@@ -1,16 +1,26 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, redirect
 import requests
 import sqlite3
 from datetime import datetime
 import os
 import logging
 from werkzeug.utils import secure_filename
+import json
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.errors import HttpError
+import io
 
 # ---------------- CONFIG ----------------
 BASE_DOMAIN = os.getenv("BASE_DOMAIN", "https://omantracking2.com")
 TOKEN = os.getenv("TOKEN")
 DB_FILE = "reports.db"
 STORAGE_PATH = os.getenv("STORAGE_PATH", "/opt/render/reports")
+
+# Google Drive Configuration
+GDRIVE_CREDENTIALS = os.getenv("GDRIVE_CREDENTIALS")
+GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID")
 
 # Create storage directory if it doesn't exist
 os.makedirs(STORAGE_PATH, exist_ok=True)
@@ -21,6 +31,76 @@ logger = logging.getLogger(__name__)
 
 # --- Flask API ---
 app = Flask(__name__)
+
+# --- Google Drive Functions ---
+def get_gdrive_service():
+    """Authenticate and create Google Drive service instance."""
+    try:
+        # Read credentials from environment variable
+        credentials_json = os.getenv("GDRIVE_CREDENTIALS")
+        if not credentials_json:
+            logger.error("GDRIVE_CREDENTIALS environment variable not set")
+            return None
+            
+        # Parse the JSON string
+        creds_dict = json.loads(credentials_json)
+        
+        creds = service_account.Credentials.from_service_account_info(
+            creds_dict, 
+            scopes=['https://www.googleapis.com/auth/drive.file']
+        )
+        service = build('drive', 'v3', credentials=creds)
+        return service
+    except Exception as e:
+        logger.exception("Error creating Google Drive service")
+        return None
+
+def save_to_gdrive(file_url, file_name):
+    """Download file from URL and save it to Google Drive."""
+    try:
+        # Download the file
+        response = requests.get(file_url, headers={"Authorization": TOKEN}, timeout=30, stream=True)
+        response.raise_for_status()
+        
+        # Create file content in memory
+        file_content = io.BytesIO()
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                file_content.write(chunk)
+        file_content.seek(0)
+        
+        # Get Google Drive service
+        service = get_gdrive_service()
+        if not service:
+            return None
+            
+        # Prepare file metadata - save to your specific folder
+        file_metadata = {
+            'name': file_name,
+            'mimeType': 'text/csv'
+        }
+        
+        # Add folder ID if specified
+        if GDRIVE_FOLDER_ID:
+            file_metadata['parents'] = [GDRIVE_FOLDER_ID]
+        
+        # Upload to Google Drive
+        media = MediaIoBaseUpload(file_content, mimetype='text/csv', resumable=True)
+        file = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id, webViewLink, webContentLink'
+        ).execute()
+        
+        # Return the web content link for direct download
+        return file.get('webContentLink')
+        
+    except HttpError as error:
+        logger.exception(f"Google Drive API error: {error}")
+        return None
+    except Exception:
+        logger.exception("Error saving file to Google Drive")
+        return None
 
 # --- Database functions ---
 def cleanup_invalid_records():
@@ -33,22 +113,19 @@ def cleanup_invalid_records():
             records = cur.fetchall()
 
             for rid, file_path in records:
-                if file_path and not os.path.exists(file_path):
-                    cur.execute("DELETE FROM downloaded_reports WHERE render_id=?", (rid,))
-                    deleted_count += 1
+                # For Google Drive links, we can't check if file exists remotely
+                # So we'll just keep them in the database
+                pass
 
             conn.commit()
 
-        if deleted_count > 0:
-            logger.info(f"Cleaned up {deleted_count} invalid database records")
-        else:
-            logger.info("No invalid database records found")
+        logger.info("Database cleanup completed")
     except Exception:
         logger.exception("Error during cleanup_invalid_records")
 
 
 def init_db():
-    """Initialize database and table if they don’t exist."""
+    """Initialize database and table if they don't exist."""
     sql = """
     CREATE TABLE IF NOT EXISTS downloaded_reports (
         render_id INTEGER PRIMARY KEY,
@@ -74,7 +151,7 @@ def init_db():
 
 
 def already_downloaded(rid):
-    """Check if a report is already downloaded and exists on disk."""
+    """Check if a report is already downloaded to Google Drive."""
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cur = conn.cursor()
@@ -82,13 +159,8 @@ def already_downloaded(rid):
             result = cur.fetchone()
 
         if result and result[0] and result[1]:
-            if os.path.exists(result[1]):
-                return result[0]
-            else:
-                with sqlite3.connect(DB_FILE) as conn:
-                    cur = conn.cursor()
-                    cur.execute("DELETE FROM downloaded_reports WHERE render_id=?", (rid,))
-                    conn.commit()
+            # For Google Drive, we assume the link is always valid
+            return result[0]
         return None
     except Exception:
         logger.exception("Error checking already_downloaded")
@@ -109,21 +181,16 @@ def save_to_db(rid, file_name, file_path):
         logger.exception("Error saving to database")
 
 
-# --- Local file storage ---
+# --- File storage ---
 def save_file_locally(file_url, file_name):
-    """Download file from URL and save it locally (streaming)."""
-    file_path = os.path.join(STORAGE_PATH, secure_filename(file_name))
-    try:
-        with requests.get(file_url, headers={"Authorization": TOKEN}, timeout=30, stream=True) as r:
-            r.raise_for_status()
-            with open(file_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-        return file_path
-    except Exception:
-        logger.exception("Error saving file locally")
-        return None
+    """Save file to Google Drive instead of local storage."""
+    gdrive_link = save_to_gdrive(file_url, file_name)
+    
+    # For database compatibility, we'll store the Google Drive link as the file_path
+    if gdrive_link:
+        # We're returning the Google Drive link as the "file_path"
+        return gdrive_link
+    return None
 
 
 # --- Routes ---
@@ -208,9 +275,14 @@ def get_report():
 @app.route("/download_file/<filename>", methods=["GET"])
 def download_file(filename):
     try:
-        file_path = os.path.join(STORAGE_PATH, secure_filename(filename))
-        if os.path.exists(file_path):
-            return send_file(file_path, as_attachment=True, download_name=filename)
+        with sqlite3.connect(DB_FILE) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT file_path FROM downloaded_reports WHERE file_name=?", (filename,))
+            result = cur.fetchone()
+            
+        if result and result[0]:
+            # Redirect to the Google Drive download link
+            return redirect(result[0])
         return jsonify({"error": "File not found"}), 404
     except Exception:
         logger.exception("Download error")
@@ -220,7 +292,12 @@ def download_file(filename):
 @app.route("/list_files", methods=["GET"])
 def list_files():
     try:
-        files = os.listdir(STORAGE_PATH)
+        # This will now only show file names, not paths
+        with sqlite3.connect(DB_FILE) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT file_name FROM downloaded_reports")
+            files = [row[0] for row in cur.fetchall()]
+            
         return jsonify({"files": files, "count": len(files)})
     except Exception:
         logger.exception("List files error")
