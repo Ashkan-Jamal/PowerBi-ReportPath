@@ -35,19 +35,14 @@ app = Flask(__name__)
 
 # --- Google Drive Functions ---
 def get_gdrive_service():
-    """Authenticate and create Google Drive service instance."""
+    """Authenticate and create Google Drive service instance using a secret file."""
     try:
-        # Load credentials from environment variable
-        credentials_json = os.getenv("GDRIVE_CREDENTIALS")
-        if not credentials_json:
-            logger.error("GDRIVE_CREDENTIALS environment variable not set")
-            return None
-
-        # Convert literal \n to actual newlines
-        credentials_json = credentials_json.replace("\\n", "\n")
-
-        # Parse JSON
-        creds_dict = json.loads(credentials_json)
+        # Path to your secret file in Render
+        secret_path = "/etc/secrets/power-bi-x-gpsgate-b793752d1634.json"
+        
+        # Read JSON credentials from file
+        with open(secret_path, "r") as f:
+            creds_dict = json.load(f)
 
         # Create service account credentials
         creds = service_account.Credentials.from_service_account_info(
@@ -59,9 +54,16 @@ def get_gdrive_service():
         service = build('drive', 'v3', credentials=creds)
         return service
 
-    except Exception as e:
+    except FileNotFoundError:
+        logger.error(f"Secret file not found at {secret_path}")
+        return None
+    except json.JSONDecodeError:
+        logger.exception("Failed to decode JSON from Google Drive secret file")
+        return None
+    except Exception:
         logger.exception("Error creating Google Drive service")
         return None
+
 
 def save_to_gdrive(file_url, file_name):
     """Download file from URL and save it to Google Drive."""
