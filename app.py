@@ -37,26 +37,30 @@ app = Flask(__name__)
 def get_gdrive_service():
     """Authenticate and create Google Drive service instance."""
     try:
-        # Read credentials from environment variable
+        # Load credentials from environment variable
         credentials_json = os.getenv("GDRIVE_CREDENTIALS")
         if not credentials_json:
             logger.error("GDRIVE_CREDENTIALS environment variable not set")
             return None
-        
-        # Fix escaped newlines in private key
-        credentials_json = credentials_json.replace('\\n', '\n')
-        
-        # Parse the JSON string
+
+        # Convert literal \n to actual newlines
+        credentials_json = credentials_json.replace("\\n", "\n")
+
+        # Parse JSON
         creds_dict = json.loads(credentials_json)
-        
+
+        # Create service account credentials
         creds = service_account.Credentials.from_service_account_info(
-            creds_dict, 
+            creds_dict,
             scopes=['https://www.googleapis.com/auth/drive.file']
         )
+
+        # Build the Drive service
         service = build('drive', 'v3', credentials=creds)
         return service
+
     except Exception as e:
-        logger.exception(f"Error creating Google Drive service: {str(e)}")
+        logger.exception("Error creating Google Drive service")
         return None
 
 def save_to_gdrive(file_url, file_name):
