@@ -7,9 +7,9 @@ import logging
 
 # ---------------- CONFIG ----------------
 BASE_DOMAIN = os.getenv("BASE_DOMAIN", "https://omantracking2.com")
-TOKEN = os.getenv("TOKEN")  # Render Env Variable
+TOKEN = os.getenv("TOKEN")
 DB_FILE = "reports.db"
-STORAGE_PATH = os.getenv("STORAGE_PATH", "/opt/render/reports")  # Render persistent disk
+STORAGE_PATH = os.getenv("STORAGE_PATH", "/opt/render/reports")
 
 # Create storage directory if it doesn't exist
 os.makedirs(STORAGE_PATH, exist_ok=True)
@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --- Flask API ---
-app = Flask(__name__)  # ✅ MUST be before routes!
+app = Flask(__name__)
 
 # --- Database functions ---
 def cleanup_invalid_records():
@@ -32,7 +32,6 @@ def cleanup_invalid_records():
     deleted_count = 0
     for rid, file_path in records:
         if file_path and not os.path.exists(file_path):
-            # File doesn't exist - delete the record
             cur.execute("DELETE FROM downloaded_reports WHERE render_id=?", (rid,))
             deleted_count += 1
     
@@ -49,13 +48,12 @@ def init_db():
         CREATE TABLE IF NOT EXISTS downloaded_reports
         (
             render_id INTEGER PRIMARY KEY,
-            file_name TEXT NOT NULL,  # ✅ Prevent null file names
-            file_path TEXT NOT NULL,   # ✅ Prevent null file paths
+            file_name TEXT NOT NULL,
+            file_path TEXT NOT NULL,
             downloaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
     
-    # ✅ Clean up any existing invalid records
     try:
         cleanup_invalid_records()
     except Exception as e:
@@ -71,13 +69,10 @@ def already_downloaded(rid):
     result = cur.fetchone()
     conn.close()
     
-    # ✅ CRITICAL FIX: Check if record exists AND has valid file data
-    if result and result[0] and result[1]:  # file_name and file_path are not null/empty
-        # Additional check: verify the file actually exists on disk
+    if result and result[0] and result[1]:
         if os.path.exists(result[1]):
-            return result[0]  # Return valid file name
+            return result[0]
         else:
-            # File doesn't exist on disk - delete the invalid database record
             conn = sqlite3.connect(DB_FILE)
             cur = conn.cursor()
             cur.execute("DELETE FROM downloaded_reports WHERE render_id=?", (rid,))
@@ -115,7 +110,6 @@ def get_report():
     if not application_id or not report_id or not render_id:
         return jsonify({"error": "application_id, report_id, and render_id are required"}), 400
 
-    # ✅ FIRST: Check if already successfully downloaded (with NULL protection)
     existing_file = already_downloaded(render_id)
     if existing_file:
         return jsonify({
@@ -125,7 +119,6 @@ def get_report():
             "file_name": existing_file
         })
 
-    # Build API URL
     url = f"{BASE_DOMAIN}/comGpsGate/api/v.1/applications/{application_id}/reports/{report_id}/renderings/{render_id}"
     headers = {"Authorization": TOKEN, "Accept": "application/json"}
     
@@ -149,7 +142,6 @@ def get_report():
         if not rid or not output_file:
             return jsonify({"error": "No report file info found in API response"}), 404
 
-        # ✅ ONLY PROCESS IF REPORT IS READY - DO NOT SAVE TO DB IF NOT READY!
         if is_ready:
             file_url = f"{BASE_DOMAIN}{output_file}"
             
@@ -157,11 +149,9 @@ def get_report():
             if csv_resp.status_code != 200:
                 return jsonify({"error": f"Failed to fetch CSV {csv_resp.status_code}"}), csv_resp.status_code
 
-            # Generate unique filename
             file_name = f"{application_id}-{report_id}-{render_id}-{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
             file_path = save_file_locally(csv_resp.content, file_name)
             
-            # ✅ ONLY SAVE TO DATABASE AFTER SUCCESSFUL DOWNLOAD!
             save_to_db(rid, file_name, file_path)
 
             return jsonify({
@@ -173,7 +163,6 @@ def get_report():
                 "message": "File saved successfully"
             })
 
-        # ✅ REPORT NOT READY - DO NOT SAVE TO DATABASE!
         return jsonify({
             "message": "Report not ready yet",
             "application_id": application_id,
@@ -215,7 +204,6 @@ def health_check():
 
 @app.route("/admin/cleanup", methods=["POST"])
 def admin_cleanup():
-    """Manual cleanup endpoint for emergency fixes"""
     try:
         cleanup_invalid_records()
         return jsonify({"message": "Database cleanup completed"})
