@@ -99,7 +99,8 @@ def save_to_gdrive(file_url, file_name):
         file = service.files().create(
             body=file_metadata,
             media_body=media,
-            fields='id, webViewLink, webContentLink'
+            fields='id, webViewLink, webContentLink',
+            supportsAllDrives=True
         ).execute()
         
         # Return the web content link for direct download
