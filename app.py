@@ -267,19 +267,16 @@ def list_files():
         return jsonify({"error": "Failed to list files"}), 500
 
 
-@app.route("/health", methods=["GET"])
-def health_check():
-    return jsonify({
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "db_file_exists": os.path.exists(DB_FILE),
-        "gdrive_configured": bool(GDRIVE_CREDENTIALS),
-        "gdrive_folder_set": bool(GDRIVE_FOLDER_ID)
-    })
-
-
 @app.route("/admin/cleanup", methods=["POST"])
 def admin_cleanup():
     try:
         cleanup_invalid_records()
-        return jsonify
+        return jsonify({"message": "Database cleanup completed"})
+    except Exception:
+        logger.exception("Cleanup error")
+        return jsonify({"error": "Cleanup failed"}), 500
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
+
