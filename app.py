@@ -37,16 +37,12 @@ app = Flask(__name__)
 def get_gdrive_service():
     """Authenticate and create Google Drive service instance using a secret file."""
     try:
-        # Path to your secret file in Render
         secret_path = "/etc/secrets/power-bi-x-gpsgate-b793752d1634.json"
-        # Read JSON credentials from file
         with open(secret_path, "r") as f:
             creds_dict = json.load(f)
-        # Create service account credentials
         creds = service_account.Credentials.from_service_account_info(
             creds_dict, scopes=['https://www.googleapis.com/auth/drive.file']
         )
-        # Build the Drive service
         service = build('drive', 'v3', credentials=creds)
         return service
     except FileNotFoundError:
@@ -59,31 +55,31 @@ def get_gdrive_service():
         logger.exception("Error creating Google Drive service")
         return None
 
-def save_to_gdrive(file_url, file_name):
+def save_to_gdrive(file_url, file_name, token_override=None):
     """Download file from URL and save it to Google Drive."""
     try:
-        # Download the file
-        response = requests.get(file_url, headers={"Authorization": TOKEN}, timeout=30, stream=True)
+        # Use provided token if given, else default
+        headers = {"Authorization": token_override or TOKEN}
+        response = requests.get(file_url, headers=headers, timeout=30, stream=True)
         response.raise_for_status()
-        # Create file content in memory
+
         file_content = io.BytesIO()
         for chunk in response.iter_content(chunk_size=8192):
             if chunk:
                 file_content.write(chunk)
         file_content.seek(0)
-        # Get Google Drive service
+
         service = get_gdrive_service()
         if not service:
             return None
-        # Prepare file metadata - save to your specific folder
+
         file_metadata = {
             'name': file_name,
             'mimeType': 'text/csv'
         }
-        # Add folder ID if specified
         if GDRIVE_FOLDER_ID:
             file_metadata['parents'] = [GDRIVE_FOLDER_ID]
-        # Upload to Google Drive
+
         media = MediaIoBaseUpload(file_content, mimetype='text/csv', resumable=True)
         file = service.files().create(
             body=file_metadata,
@@ -91,7 +87,7 @@ def save_to_gdrive(file_url, file_name):
             fields='id, webViewLink, webContentLink',
             supportsAllDrives=True
         ).execute()
-        # Return the web content link for direct download
+
         return file.get('webContentLink')
     except HttpError as error:
         logger.exception(f"Google Drive API error: {error}")
@@ -102,15 +98,12 @@ def save_to_gdrive(file_url, file_name):
 
 # --- Database functions ---
 def cleanup_invalid_records():
-    """Clean up any database records that point to non-existent files."""
     try:
-        # For Google Drive, we don't need to check file existence
         logger.info("Database cleanup completed (Google Drive mode)")
     except Exception:
         logger.exception("Error during cleanup_invalid_records")
 
 def init_db():
-    """Initialize database and table if they don't exist."""
     sql = """
     CREATE TABLE IF NOT EXISTS downloaded_reports (
         render_id INTEGER PRIMARY KEY,
@@ -124,12 +117,10 @@ def init_db():
             cur = conn.cursor()
             logger.info("Ensuring 'downloaded_reports' table exists...")
             cur.execute(sql)
-            # Check if we need to migrate old schema
             cur.execute("PRAGMA table_info(downloaded_reports)")
             columns = [col[1] for col in cur.fetchall()]
             if 'file_name' not in columns:
                 logger.info("Migrating database schema...")
-                # Backup old data if needed
                 cur.execute("ALTER TABLE downloaded_reports RENAME TO downloaded_reports_old")
                 cur.execute(sql)
             conn.commit()
@@ -141,11 +132,9 @@ def init_db():
         logger.exception("Unexpected error during init_db")
 
 def already_downloaded(rid):
-    """Check if a report is already downloaded to Google Drive."""
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cur = conn.cursor()
-            # First check if the table has the right columns
             cur.execute("PRAGMA table_info(downloaded_reports)")
             columns = [col[1] for col in cur.fetchall()]
             if 'file_name' not in columns:
@@ -153,7 +142,6 @@ def already_downloaded(rid):
             cur.execute("SELECT file_name, file_path FROM downloaded_reports WHERE render_id=?", (rid,))
             result = cur.fetchone()
         if result and result[0] and result[1]:
-            # For Google Drive, we assume the link is always valid
             return result[0]
         return None
     except Exception:
@@ -161,7 +149,6 @@ def already_downloaded(rid):
         return None
 
 def save_to_db(rid, file_name, file_path):
-    """Save report metadata to the database."""
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cur = conn.cursor()
@@ -174,12 +161,9 @@ def save_to_db(rid, file_name, file_path):
         logger.exception("Error saving to database")
 
 # --- File storage ---
-def save_file_locally(file_url, file_name):
-    """Save file to Google Drive instead of local storage."""
-    gdrive_link = save_to_gdrive(file_url, file_name)
-    # For database compatibility, we'll store the Google Drive link as the file_path
+def save_file_locally(file_url, file_name, token_override=None):
+    gdrive_link = save_to_gdrive(file_url, file_name, token_override=token_override)
     if gdrive_link:
-        # We're returning the Google Drive link as the "file_path"
         return gdrive_link
     return None
 
@@ -192,6 +176,11 @@ def get_report():
     render_id = request.args.get("render_id")
     if not application_id or not report_id or not render_id:
         return jsonify({"error": "application_id, report_id, and render_id are required"}), 400
+
+    # --- Dynamic token from request header ---
+    auth_header = request.headers.get("Authorization")
+    token_to_use = auth_header or TOKEN
+
     existing_file = already_downloaded(render_id)
     if existing_file:
         return jsonify({
@@ -200,9 +189,11 @@ def get_report():
             "download_url": f"{request.host_url}download_file/{existing_file}",
             "file_name": existing_file
         })
+
     url = f"{BASE_DOMAIN}/comGpsGate/api/v.1/applications/{application_id}/reports/{report_id}/renderings/{render_id}"
-    headers = {"Authorization": TOKEN, "Accept": "application/json"}
+    headers = {"Authorization": token_to_use, "Accept": "application/json"}
     logger.info(f"Calling GPSGate API: {url}")
+
     try:
         response = requests.get(url, headers=headers, timeout=30)
         if response.status_code != 200:
@@ -210,16 +201,19 @@ def get_report():
                 "error": f"Error fetching render info {response.status_code}",
                 "details": response.text
             }), response.status_code
+
         data = response.json()
         rid = data.get("id")
         output_file = data.get("outputFile")
         is_ready = data.get("isReady")
+
         if not rid or not output_file:
             return jsonify({"error": "No report file info found in API response"}), 404
+
         if is_ready:
             file_url = f"{BASE_DOMAIN}{output_file}"
             file_name = f"{application_id}-{report_id}-{render_id}-{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-            file_path = save_file_locally(file_url, file_name)
+            file_path = save_file_locally(file_url, file_name, token_override=token_to_use)
             if not file_path:
                 return jsonify({"error": "Failed to save file to Google Drive"}), 500
             save_to_db(rid, file_name, file_path)
@@ -231,6 +225,7 @@ def get_report():
                 "file_name": file_name,
                 "message": "File saved successfully to Google Drive"
             })
+
         return jsonify({
             "message": "Report not ready yet",
             "application_id": application_id,
@@ -253,7 +248,6 @@ def download_file(filename):
             cur.execute("SELECT file_path FROM downloaded_reports WHERE file_name=?", (filename,))
             result = cur.fetchone()
             if result and result[0]:
-                # Redirect to the Google Drive download link
                 return redirect(result[0])
         return jsonify({"error": "File not found"}), 404
     except Exception:
@@ -263,7 +257,6 @@ def download_file(filename):
 @app.route("/list_files", methods=["GET"])
 def list_files():
     try:
-        # This will now only show file names, not paths
         with sqlite3.connect(DB_FILE) as conn:
             cur = conn.cursor()
             cur.execute("SELECT file_name FROM downloaded_reports")
