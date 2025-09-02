@@ -1,111 +1,134 @@
-from flask import Flask, request, jsonify, send_file, redirect
-import requests
-import sqlite3
-from datetime import datetime
 import os
-import logging
-from werkzeug.utils import secure_filename
+import io
 import json
+import sqlite3
+import logging
+import requests
+from flask import Flask, request, jsonify
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from googleapiclient.errors import HttpError
-import io
-import re
 
-# ---------------- CONFIG ----------------
-BASE_DOMAIN = os.getenv("BASE_DOMAIN", "https://omantracking2.com")
-TOKEN = os.getenv("TOKEN")
-DB_FILE = "reports.db"
-STORAGE_PATH = os.getenv("STORAGE_PATH", "/opt/render/reports")
-
-# Google Drive Configuration
-GDRIVE_CREDENTIALS = os.getenv("GDRIVE_CREDENTIALS")
-GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID")
-
-# Create storage directory if it doesn't exist
-os.makedirs(STORAGE_PATH, exist_ok=True)
-
-# Set up logging
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Flask API ---
 app = Flask(__name__)
 
-# --- Google Drive Functions ---
+# Database file
+DATABASE = "reports.db"
+
+# Environment variables
+TOKEN = os.getenv("API_TOKEN")
+GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID")
+GDRIVE_CREDENTIALS = os.getenv("GDRIVE_CREDENTIALS")  # path to JSON file in /etc/secrets/
+
+
+def init_db():
+    """Initialize database."""
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS downloaded_reports (
+            report_id TEXT NOT NULL,
+            render_id TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            PRIMARY KEY (report_id, render_id)
+        )"""
+    )
+    conn.commit()
+    conn.close()
+
+
 def get_gdrive_service():
-    """Authenticate and create Google Drive service instance using a secret file."""
+    """Authenticate and create Google Drive service instance."""
     try:
-        # Path to your secret file in Render
-        secret_path = "/etc/secrets/power-bi-x-gpsgate-b793752d1634.json"
-        
-        # Read JSON credentials from file
-        with open(secret_path, "r") as f:
+        if not GDRIVE_CREDENTIALS or not os.path.exists(GDRIVE_CREDENTIALS):
+            logger.error("Google Drive credentials file not found")
+            return None
+
+        with open(GDRIVE_CREDENTIALS, "r") as f:
             creds_dict = json.load(f)
 
-        # Create service account credentials
         creds = service_account.Credentials.from_service_account_info(
             creds_dict,
-            scopes=['https://www.googleapis.com/auth/drive.file']
+            scopes=["https://www.googleapis.com/auth/drive.file"],
         )
-
-        # Build the Drive service
-        service = build('drive', 'v3', credentials=creds)
+        service = build("drive", "v3", credentials=creds)
         return service
-
-    except FileNotFoundError:
-        logger.error(f"Secret file not found at {secret_path}")
+    except Exception as e:
+        logger.exception("Error creating Google Drive service")
         return None
-    except json.JSONDecodeError:
-        logger.exception("Failed to decode JSON from Google Drive secret file")
+
+
+def already_downloaded(report_id, render_id):
+    """Check if report already downloaded and file still exists in Drive."""
+    try:
+        conn = sqlite3.connect(DATABASE)
+        c = conn.cursor()
+        c.execute(
+            "SELECT file_name FROM downloaded_reports WHERE report_id=? AND render_id=?",
+            (report_id, render_id),
+        )
+        row = c.fetchone()
+        conn.close()
+
+        if row:
+            file_id = row[0]  # This is the Drive file id/name
+            service = get_gdrive_service()
+            if not service:
+                return None
+            try:
+                # Validate file existence in Drive
+                service.files().get(fileId=file_id, fields="id").execute()
+                return file_id
+            except HttpError as e:
+                if e.resp.status == 404:
+                    logger.warning(
+                        f"Stale DB entry for report_id={report_id}, render_id={render_id}, cleaning up"
+                    )
+                    delete_downloaded_report(report_id, render_id)
+                return None
         return None
     except Exception:
-        logger.exception("Error creating Google Drive service")
+        logger.exception("Error checking if report already downloaded")
         return None
 
 
 def save_to_gdrive(file_url, file_name):
     """Download file from URL and save it to Google Drive."""
     try:
-        # Download the file
-        response = requests.get(file_url, headers={"Authorization": TOKEN}, timeout=30, stream=True)
+        response = requests.get(
+            file_url, headers={"Authorization": TOKEN}, timeout=30, stream=True
+        )
         response.raise_for_status()
-        
-        # Create file content in memory
+
         file_content = io.BytesIO()
         for chunk in response.iter_content(chunk_size=8192):
             if chunk:
                 file_content.write(chunk)
         file_content.seek(0)
-        
-        # Get Google Drive service
+
         service = get_gdrive_service()
         if not service:
             return None
-            
-        # Prepare file metadata - save to your specific folder
-        file_metadata = {
-            'name': file_name,
-            'mimeType': 'text/csv'
-        }
-        
-        # Add folder ID if specified
+
+        file_metadata = {"name": file_name, "mimeType": "text/csv"}
         if GDRIVE_FOLDER_ID:
-            file_metadata['parents'] = [GDRIVE_FOLDER_ID]
-        
-        # Upload to Google Drive
-        media = MediaIoBaseUpload(file_content, mimetype='text/csv', resumable=True)
-        file = service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields='id, webViewLink, webContentLink',
-            supportsAllDrives=True
-        ).execute()
-        
-        # Return the web content link for direct download
-        return file.get('webContentLink')
-        
+            file_metadata["parents"] = [GDRIVE_FOLDER_ID]
+
+        media = MediaIoBaseUpload(file_content, mimetype="text/csv", resumable=True)
+        file = (
+            service.files()
+            .create(
+                body=file_metadata,
+                media_body=media,
+                fields="id, webViewLink, webContentLink",
+            )
+            .execute()
+        )
+        return file.get("id")  # Store ID instead of link
     except HttpError as error:
         logger.exception(f"Google Drive API error: {error}")
         return None
@@ -113,234 +136,91 @@ def save_to_gdrive(file_url, file_name):
         logger.exception("Error saving file to Google Drive")
         return None
 
-# --- Database functions ---
+
+def record_download(report_id, render_id, file_id):
+    """Record downloaded file in DB."""
+    try:
+        conn = sqlite3.connect(DATABASE)
+        c = conn.cursor()
+        c.execute(
+            "INSERT OR REPLACE INTO downloaded_reports (report_id, render_id, file_name) VALUES (?, ?, ?)",
+            (report_id, render_id, file_id),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        logger.exception("Error recording download in DB")
+
+
+def delete_downloaded_report(report_id, render_id):
+    """Delete stale DB entry."""
+    try:
+        conn = sqlite3.connect(DATABASE)
+        c = conn.cursor()
+        c.execute(
+            "DELETE FROM downloaded_reports WHERE report_id=? AND render_id=?",
+            (report_id, render_id),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        logger.exception("Error deleting stale DB record")
+
+
 def cleanup_invalid_records():
-    """Clean up any database records that point to non-existent files."""
+    """Clean up stale DB records that point to missing Drive files."""
     try:
-        # For Google Drive, we don't need to check file existence
-        logger.info("Database cleanup completed (Google Drive mode)")
+        conn = sqlite3.connect(DATABASE)
+        c = conn.cursor()
+        c.execute("SELECT report_id, render_id, file_name FROM downloaded_reports")
+        rows = c.fetchall()
+        conn.close()
+
+        if not rows:
+            return
+
+        service = get_gdrive_service()
+        if not service:
+            return
+
+        for report_id, render_id, file_id in rows:
+            try:
+                service.files().get(fileId=file_id, fields="id").execute()
+            except HttpError as e:
+                if e.resp.status == 404:
+                    logger.warning(
+                        f"Removing stale DB entry for report_id={report_id}, render_id={render_id}"
+                    )
+                    delete_downloaded_report(report_id, render_id)
     except Exception:
-        logger.exception("Error during cleanup_invalid_records")
-
-
-def init_db():
-    """Initialize database and table if they don't exist."""
-    sql = """
-    CREATE TABLE IF NOT EXISTS downloaded_reports (
-        render_id INTEGER PRIMARY KEY,
-        file_name TEXT NOT NULL,
-        file_path TEXT NOT NULL,
-        downloaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-    """
-    try:
-        with sqlite3.connect(DB_FILE) as conn:
-            cur = conn.cursor()
-            logger.info("Ensuring 'downloaded_reports' table exists...")
-            cur.execute(sql)
-            
-            # Check if we need to migrate old schema
-            cur.execute("PRAGMA table_info(downloaded_reports)")
-            columns = [col[1] for col in cur.fetchall()]
-            
-            if 'file_name' not in columns:
-                logger.info("Migrating database schema...")
-                # Backup old data if needed
-                cur.execute("ALTER TABLE downloaded_reports RENAME TO downloaded_reports_old")
-                cur.execute(sql)
-                
-            conn.commit()
-
-        cleanup_invalid_records()
-        logger.info("Database initialization completed successfully")
-
-    except sqlite3.Error as e:
-        logger.exception(f"SQLite error during init_db: {e}")
-    except Exception:
-        logger.exception("Unexpected error during init_db")
-
-
-def already_downloaded(rid):
-    """Check if a report is already downloaded to Google Drive."""
-    try:
-        with sqlite3.connect(DB_FILE) as conn:
-            cur = conn.cursor()
-            # First check if the table has the right columns
-            cur.execute("PRAGMA table_info(downloaded_reports)")
-            columns = [col[1] for col in cur.fetchall()]
-            
-            if 'file_name' not in columns:
-                return None
-                
-            cur.execute("SELECT file_name, file_path FROM downloaded_reports WHERE render_id=?", (rid,))
-            result = cur.fetchone()
-
-        if result and result[0] and result[1]:
-            # For Google Drive, we assume the link is always valid
-            return result[0]
-        return None
-    except Exception:
-        logger.exception("Error checking already_downloaded")
-        return None
-
-
-def save_to_db(rid, file_name, file_path):
-    """Save report metadata to the database."""
-    try:
-        with sqlite3.connect(DB_FILE) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "INSERT OR REPLACE INTO downloaded_reports (render_id, file_name, file_path) VALUES (?, ?, ?)",
-                (rid, file_name, file_path)
-            )
-            conn.commit()
-    except Exception:
-        logger.exception("Error saving to database")
-
-
-# --- File storage ---
-def save_file_locally(file_url, file_name):
-    """Save file to Google Drive instead of local storage."""
-    gdrive_link = save_to_gdrive(file_url, file_name)
-    
-    # For database compatibility, we'll store the Google Drive link as the file_path
-    if gdrive_link:
-        # We're returning the Google Drive link as the "file_path"
-        return gdrive_link
-    return None
-
-
-# --- Routes ---
-@app.route("/get_report", methods=["GET"])
-def get_report():
-    init_db()
-
-    application_id = request.args.get("application_id")
-    report_id = request.args.get("report_id")
-    render_id = request.args.get("render_id")
-
-    if not application_id or not report_id or not render_id:
-        return jsonify({"error": "application_id, report_id, and render_id are required"}), 400
-
-    existing_file = already_downloaded(render_id)
-    if existing_file:
-        return jsonify({
-            "message": "Report already processed",
-            "render_id": render_id,
-            "download_url": f"{request.host_url}download_file/{existing_file}",
-            "file_name": existing_file
-        })
-
-    url = f"{BASE_DOMAIN}/comGpsGate/api/v.1/applications/{application_id}/reports/{report_id}/renderings/{render_id}"
-    headers = {"Authorization": TOKEN, "Accept": "application/json"}
-
-    logger.info(f"Calling GPSGate API: {url}")
-
-    try:
-        response = requests.get(url, headers=headers, timeout=30)
-
-        if response.status_code != 200:
-            return jsonify({
-                "error": f"Error fetching render info {response.status_code}",
-                "details": response.text
-            }), response.status_code
-
-        data = response.json()
-
-        rid = data.get("id")
-        output_file = data.get("outputFile")
-        is_ready = data.get("isReady")
-
-        if not rid or not output_file:
-            return jsonify({"error": "No report file info found in API response"}), 404
-
-        if is_ready:
-            file_url = f"{BASE_DOMAIN}{output_file}"
-            file_name = f"{application_id}-{report_id}-{render_id}-{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-            file_path = save_file_locally(file_url, file_name)
-
-            if not file_path:
-                return jsonify({"error": "Failed to save file to Google Drive"}), 500
-
-            save_to_db(rid, file_name, file_path)
-
-            return jsonify({
-                "application_id": application_id,
-                "report_id": report_id,
-                "render_id": rid,
-                "download_url": f"{request.host_url}download_file/{file_name}",
-                "file_name": file_name,
-                "message": "File saved successfully to Google Drive"
-            })
-
-        return jsonify({
-            "message": "Report not ready yet",
-            "application_id": application_id,
-            "report_id": report_id,
-            "render_id": render_id,
-            "status": "processing"
-        })
-
-    except requests.exceptions.RequestException as e:
-        logger.exception("Request error")
-        return jsonify({"error": f"Network error: {str(e)}"}), 500
-    except Exception:
-        logger.exception("Unexpected error in get_report")
-        return jsonify({"error": "Internal server error"}), 500
-
-
-@app.route("/download_file/<filename>", methods=["GET"])
-def download_file(filename):
-    try:
-        with sqlite3.connect(DB_FILE) as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT file_path FROM downloaded_reports WHERE file_name=?", (filename,))
-            result = cur.fetchone()
-            
-        if result and result[0]:
-            # Redirect to the Google Drive download link
-            return redirect(result[0])
-        return jsonify({"error": "File not found"}), 404
-    except Exception:
-        logger.exception("Download error")
-        return jsonify({"error": "Download failed"}), 500
-
-
-@app.route("/list_files", methods=["GET"])
-def list_files():
-    try:
-        # This will now only show file names, not paths
-        with sqlite3.connect(DB_FILE) as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT file_name FROM downloaded_reports")
-            files = [row[0] for row in cur.fetchall()]
-            
-        return jsonify({"files": files, "count": len(files)})
-    except Exception:
-        logger.exception("List files error")
-        return jsonify({"error": "Failed to list files"}), 500
+        logger.exception("Error cleaning up invalid DB records")
 
 
 @app.route("/health", methods=["GET"])
 def health_check():
-    return jsonify({
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "db_file_exists": os.path.exists(DB_FILE),
-        "gdrive_configured": bool(GDRIVE_CREDENTIALS),
-        "gdrive_folder_set": bool(GDRIVE_FOLDER_ID)
-    })
-
-
-@app.route("/admin/cleanup", methods=["POST"])
-def admin_cleanup():
     try:
-        cleanup_invalid_records()
-        return jsonify({"message": "Database cleanup completed"})
+        status = {"status": "ok", "database": False, "gdrive_configured": False}
+
+        # DB check
+        try:
+            conn = sqlite3.connect(DATABASE)
+            c = conn.cursor()
+            c.execute("SELECT 1")
+            conn.close()
+            status["database"] = True
+        except Exception:
+            logger.exception("Database health check failed")
+
+        # Check if Drive credentials file exists
+        if GDRIVE_CREDENTIALS and os.path.exists(GDRIVE_CREDENTIALS):
+            status["gdrive_configured"] = True
+
+        return jsonify(status)
     except Exception:
-        logger.exception("Cleanup error")
-        return jsonify({"error": "Cleanup failed"}), 500
+        logger.exception("Health check failed")
+        return jsonify({"status": "error"}), 500
 
 
 if __name__ == "__main__":
+    init_db()
     app.run(host="0.0.0.0", port=5000)
