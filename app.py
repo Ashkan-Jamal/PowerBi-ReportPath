@@ -69,37 +69,52 @@ def save_to_gdrive(file_url, file_name, token_override=None):
 
 # --- Database ---
 def init_db():
+    """Initialize DB with safer schema and migrate old tables if needed."""
     schema = """
     CREATE TABLE IF NOT EXISTS downloaded_reports (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        application_id TEXT NOT NULL,
-        report_id TEXT NOT NULL,
-        request_render_id TEXT,
-        api_render_id TEXT,
-        file_name TEXT NOT NULL,
-        file_path TEXT NOT NULL,
-        downloaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        id INTEGER PRIMARY KEY AUTOINCREMENT
+        -- we'll add other columns in migration
     );
     """
     uniques = """
     CREATE UNIQUE INDEX IF NOT EXISTS ux_reports_unique
       ON downloaded_reports(application_id, report_id, api_render_id, file_name);
     """
+
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cur = conn.cursor()
+            # Step 1: ensure table exists
             cur.executescript(schema)
-            cur.execute(uniques)
-            # Legacy migration: render_id -> api_render_id
+
+            # Step 2: migrate/add missing columns
             cur.execute("PRAGMA table_info(downloaded_reports)")
             cols = [c[1] for c in cur.fetchall()]
-            if "render_id" in cols and "api_render_id" in cols:
-                cur.execute("UPDATE downloaded_reports SET api_render_id = render_id WHERE api_render_id IS NULL")
+            
+            # Add missing columns
+            for col, col_type in [
+                ("application_id", "TEXT"),
+                ("report_id", "TEXT"),
+                ("request_render_id", "TEXT"),
+                ("api_render_id", "TEXT"),
+                ("file_name", "TEXT"),
+                ("file_path", "TEXT"),
+                ("downloaded_at", "DATETIME DEFAULT CURRENT_TIMESTAMP")
+            ]:
+                if col not in cols:
+                    cur.execute(f"ALTER TABLE downloaded_reports ADD COLUMN {col} {col_type}")
+
+            # Step 3: create unique index safely
+            cur.execute(uniques)
+
             conn.commit()
         cleanup_invalid_records()
-        logger.info("DB initialized successfully")
+        logger.info("Database initialization/migration completed successfully")
+    except sqlite3.Error as e:
+        logger.exception(f"SQLite error during init_db: {e}")
     except Exception:
-        logger.exception("DB init failed")
+        logger.exception("Unexpected error during init_db")
+
 
 def cleanup_invalid_records():
     try:
