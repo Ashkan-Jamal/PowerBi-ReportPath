@@ -316,7 +316,6 @@ def admin_cleanup():
         return jsonify({"error": "Cleanup failed"}), 500
 
 if __name__ == "__main__":
+    init_db()  # create/migrate DB first
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
-if __name__ == "__main__":
-    init_db()  # <-- ensure DB is created before the server starts
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+
