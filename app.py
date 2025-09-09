@@ -114,6 +114,17 @@ def save_file_locally(file_url, file_name, token):
         return None
 
 # --- Routes ---
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({
+        "message": "Report API is running",
+        "endpoints": {
+            "get_report": "/get_report?application_id=X&report_id=Y&render_id=Z",
+            "download_file": "/download_file/<filename>",
+            "health": "/health"
+        }
+    })
+
 @app.route("/get_report", methods=["GET"])
 def get_report():
     application_id = request.args.get("application_id")
@@ -147,8 +158,8 @@ def get_report():
             "file_name": cached["file_name"]
         })
 
-    # Call GPSGate API
-    url = f"{BASE_DOMAIN}/comGpsGate/api.v.1/applications/{application_id}/reports/{report_id}/renderings/{request_render_id}"
+    # Call GPSGate API - FIXED URL (api/v1 instead of api.v.1)
+    url = f"{BASE_DOMAIN}/comGpsGate/api/v1/applications/{application_id}/reports/{report_id}/renderings/{request_render_id}"
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
@@ -156,7 +167,8 @@ def get_report():
     }
 
     try:
-        logger.info(f"Calling GPSGate API: {url}")
+        logger.info(f"Calling GPSGate API with URL: {url}")
+        logger.info(f"Using token: {token[:20]}...")  # Debug token
         response = requests.get(url, headers=headers, timeout=30)
         
         if response.status_code != 200:
