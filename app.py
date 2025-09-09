@@ -1,4 +1,5 @@
-from flask import Flask, request, jsonify, redirect
+from flask import Flask, request, jsonify, redirect, send_file
+from flask_cors import CORS
 import requests
 import sqlite3
 from datetime import datetime
@@ -12,6 +13,7 @@ from googleapiclient.http import MediaIoBaseUpload
 from googleapiclient.errors import HttpError
 import io
 import time
+import shutil
 
 # ---------------- CONFIG ----------------
 BASE_DOMAIN = os.getenv("BASE_DOMAIN", "https://omantracking2.com")
@@ -28,13 +30,44 @@ os.makedirs(STORAGE_PATH, exist_ok=True)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 
 # --- Google Drive ---
 def get_gdrive_service():
     try:
-        secret_path = "/etc/secrets/power-bi-x-gpsgate-b793752d1634.json"
-        with open(secret_path, "r") as f:
-            creds_dict = json.load(f)
+        # Try multiple possible credential paths
+        credential_paths = [
+            "/etc/secrets/power-bi-x-gpsgate-b793752d1634.json",
+            "credentials.json",
+            os.path.join(os.getcwd(), "credentials.json"),
+            os.path.expanduser("~/credentials.json")
+        ]
+        
+        creds_dict = None
+        for path in credential_paths:
+            if os.path.exists(path):
+                try:
+                    with open(path, "r") as f:
+                        creds_dict = json.load(f)
+                    logger.info(f"Using credentials from: {path}")
+                    break
+                except (json.JSONDecodeError, IOError) as e:
+                    logger.warning(f"Failed to read credentials from {path}: {e}")
+                    continue
+        
+        # If no file found, try environment variable
+        if not creds_dict and GDRIVE_CREDENTIALS:
+            try:
+                creds_dict = json.loads(GDRIVE_CREDENTIALS)
+                logger.info("Using credentials from environment variable")
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON in GDRIVE_CREDENTIALS: {e}")
+                return None
+        
+        if not creds_dict:
+            logger.error("No valid Google Drive credentials found")
+            return None
+            
         creds = service_account.Credentials.from_service_account_info(
             creds_dict, scopes=['https://www.googleapis.com/auth/drive.file']
         )
@@ -45,7 +78,11 @@ def get_gdrive_service():
 
 def save_to_gdrive(file_url, file_name, token_override=None):
     try:
-        headers = {"Authorization": token_override or TOKEN}
+        token = token_override or TOKEN
+        if not token:
+            logger.error("No authorization token available for Google Drive upload")
+            return None
+        headers = {"Authorization": f"Bearer {token}"}
         response = requests.get(file_url, headers=headers, timeout=30, stream=True)
         response.raise_for_status()
         file_content = io.BytesIO(response.content)
@@ -70,24 +107,27 @@ def save_to_gdrive(file_url, file_name, token_override=None):
 # --- Database ---
 def init_db():
     """Initialize DB with safer schema and migrate old tables if needed."""
+    # Create table with all columns from the start to avoid schema issues
     schema = """
     CREATE TABLE IF NOT EXISTS downloaded_reports (
-        id INTEGER PRIMARY KEY AUTOINCREMENT
-        -- we'll add other columns in migration
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        application_id TEXT,
+        report_id TEXT,
+        request_render_id TEXT,
+        api_render_id TEXT,
+        file_name TEXT,
+        file_path TEXT,
+        downloaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
-    """
-    uniques = """
-    CREATE UNIQUE INDEX IF NOT EXISTS ux_reports_unique
-      ON downloaded_reports(application_id, report_id, api_render_id, file_name);
     """
 
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cur = conn.cursor()
-            # Step 1: ensure table exists
+            # Step 1: ensure table exists with all columns
             cur.executescript(schema)
 
-            # Step 2: migrate/add missing columns
+            # Step 2: migrate/add missing columns for existing tables
             cur.execute("PRAGMA table_info(downloaded_reports)")
             cols = [c[1] for c in cur.fetchall()]
             
@@ -104,8 +144,17 @@ def init_db():
                 if col not in cols:
                     cur.execute(f"ALTER TABLE downloaded_reports ADD COLUMN {col} {col_type}")
 
-            # Step 3: create unique index safely
-            cur.execute(uniques)
+            # Step 3: create unique index safely (only after columns exist)
+            try:
+                cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS ux_reports_unique
+                      ON downloaded_reports(application_id, report_id, api_render_id, file_name)
+                """)
+            except sqlite3.OperationalError as e:
+                if "no such column" in str(e).lower():
+                    logger.warning("Skipping unique index creation due to missing columns")
+                else:
+                    raise
 
             conn.commit()
         cleanup_invalid_records()
@@ -172,17 +221,42 @@ def save_to_db(application_id, report_id, request_render_id, api_render_id, file
 
 # --- File storage ---
 def save_file_locally(file_url, file_name, token_override=None):
-    gdrive_link = save_to_gdrive(file_url, file_name, token_override)
-    if gdrive_link:
-        return gdrive_link
+    # Try Google Drive first if configured
+    if GDRIVE_CREDENTIALS or GDRIVE_FOLDER_ID:
+        gdrive_link = save_to_gdrive(file_url, file_name, token_override)
+        if gdrive_link:
+            return gdrive_link
+    
     # Fallback to local storage
     try:
-        local_path = os.path.join(STORAGE_PATH, file_name)
-        headers = {"Authorization": token_override or TOKEN}
+        # Ensure storage directory exists
+        os.makedirs(STORAGE_PATH, exist_ok=True)
+        
+        # Use secure filename to prevent path traversal
+        safe_filename = secure_filename(file_name)
+        local_path = os.path.join(STORAGE_PATH, safe_filename)
+        
+        # Validate that the final path is within the storage directory
+        if not os.path.abspath(local_path).startswith(os.path.abspath(STORAGE_PATH)):
+            raise ValueError("Invalid file path - potential directory traversal attack")
+        
+        token = token_override or TOKEN
+        if not token:
+            raise ValueError("No authorization token available")
+        headers = {"Authorization": f"Bearer {token}"}
+            
         r = requests.get(file_url, headers=headers, timeout=30, stream=True)
         r.raise_for_status()
-        with open(local_path, "wb") as f:
-            f.write(r.content)
+        
+        # Write file atomically
+        temp_path = local_path + ".tmp"
+        with open(temp_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        
+        # Atomic move to final location
+        shutil.move(temp_path, local_path)
         return local_path
     except Exception:
         logger.exception("Failed to save locally")
@@ -199,9 +273,16 @@ def get_report():
     if not application_id or not report_id or not request_render_id:
         return jsonify({"error": "application_id, report_id, and render_id required"}), 400
 
-    token_to_use = request.headers.get("Authorization") or TOKEN
+    # Get token from header or use default
+    auth_header = request.headers.get("Authorization")
+    token_to_use = auth_header or TOKEN
+    
     if not token_to_use:
         return jsonify({"error": "Missing Authorization token"}), 401
+    
+    # Clean up token format (remove "Bearer " prefix if present)
+    if token_to_use.startswith("Bearer "):
+        token_to_use = token_to_use[7:]
 
     cached = already_downloaded(application_id, report_id, request_render_id=request_render_id)
     if cached:
@@ -215,7 +296,7 @@ def get_report():
         })
 
     url = f"{BASE_DOMAIN}/comGpsGate/api.v.1/applications/{application_id}/reports/{report_id}/renderings/{request_render_id}"
-    headers = {"Authorization": token_to_use, "Accept": "application/json"}
+    headers = {"Authorization": f"Bearer {token_to_use}", "Accept": "application/json"}
     logger.info(f"Calling GPSGate API: {url}")
 
     try:
@@ -271,13 +352,36 @@ def get_report():
 def download_file(filename):
     try:
         filename = secure_filename(filename)
+        if not filename:
+            return jsonify({"error": "Invalid filename"}), 400
+            
         with sqlite3.connect(DB_FILE) as conn:
             cur = conn.cursor()
             cur.execute("SELECT file_path FROM downloaded_reports WHERE file_name=?", (filename,))
             row = cur.fetchone()
             if row:
-                return redirect(row[0])
-        return jsonify({"error": "File not found"}), 404
+                file_path = row[0]
+                
+                # Check if it's a Google Drive link
+                if file_path.startswith('http'):
+                    return redirect(file_path)
+                
+                # For local files, validate path security
+                if os.path.exists(file_path):
+                    # Ensure the file is within the storage directory
+                    abs_file_path = os.path.abspath(file_path)
+                    abs_storage_path = os.path.abspath(STORAGE_PATH)
+                    
+                    if abs_file_path.startswith(abs_storage_path):
+                        return send_file(file_path, as_attachment=True)
+                    else:
+                        logger.warning(f"Attempted access to file outside storage directory: {file_path}")
+                        return jsonify({"error": "File access denied"}), 403
+                else:
+                    logger.warning(f"File not found on disk: {file_path}")
+                    return jsonify({"error": "File not found on disk"}), 404
+                    
+        return jsonify({"error": "File not found in database"}), 404
     except Exception:
         logger.exception("Download error")
         return jsonify({"error": "Download failed"}), 500
