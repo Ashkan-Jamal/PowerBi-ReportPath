@@ -95,9 +95,9 @@ def save_file_locally(file_url, file_name, token):
         if not os.path.abspath(local_path).startswith(os.path.abspath(STORAGE_PATH)):
             raise ValueError("Invalid file path")
         
-        # --- FIXED AUTH HEADER ---
+        # Always use API token as-is
         headers = {
-            "Authorization": f"token {token}",
+            "Authorization": token,
             "Accept": "application/json"
         }
         
@@ -138,16 +138,15 @@ def get_report():
     if not all([application_id, report_id, request_render_id]):
         return jsonify({"error": "application_id, report_id, and render_id are required"}), 400
 
-    # Get token from Authorization header (NOT from query string)
+    # Get token from Authorization header (NOT from query string ideally)
     auth_header = request.headers.get("Authorization")
-    if auth_header and auth_header.startswith("Bearer "):
-        token = auth_header[7:]  # Remove "Bearer " prefix
+    if auth_header:
+        token = auth_header.strip()
     else:
-        # If no Bearer token in header, check if token was mistakenly passed as query param
         token = request.args.get("Authorization") or TOKEN
     
     if not token:
-        return jsonify({"error": "Authorization token is required. Use Authorization header with Bearer prefix"}), 401
+        return jsonify({"error": "Authorization token is required. Pass it in the Authorization header"}), 401
 
     logger.info(f"Request parameters: app_id={application_id}, report_id={report_id}, render_id={request_render_id}")
     logger.info(f"Using token: {token[:20]}...")  
@@ -164,17 +163,16 @@ def get_report():
             "file_name": cached["file_name"]
         })
 
-    # CORRECTED URL - using api/v.1 (with dot) instead of api/v1 (with slash)
     url = f"{BASE_DOMAIN}/comGpsGate/api/v.1/applications/{application_id}/reports/{report_id}/renderings/{request_render_id}"
     headers = {
-        "Authorization": f"token {token}",  # FIXED HERE
+        "Authorization": token,  # Always API token, no prefix
         "Accept": "application/json",
         "Content-Type": "application/json"
     }
 
     try:
         logger.info(f"Calling GPSGate API with URL: {url}")
-        logger.info(f"Using token: {token[:20]}...")  # Debug token
+        logger.info(f"Using token: {token[:20]}...")
         response = requests.get(url, headers=headers, timeout=30)
         
         if response.status_code != 200:
