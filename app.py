@@ -158,8 +158,8 @@ def get_report():
             "file_name": cached["file_name"]
         })
 
-    # Call GPSGate API - FIXED URL (api/v1 instead of api.v.1)
-    url = f"{BASE_DOMAIN}/comGpsGate/api/v1/applications/{application_id}/reports/{report_id}/renderings/{request_render_id}"
+    # CORRECTED URL - using api/v.1 (with dot) instead of api/v1 (with slash)
+    url = f"{BASE_DOMAIN}/comGpsGate/api/v.1/applications/{application_id}/reports/{report_id}/renderings/{request_render_id}"
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
