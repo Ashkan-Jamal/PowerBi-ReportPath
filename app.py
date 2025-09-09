@@ -134,17 +134,19 @@ def get_report():
     if not all([application_id, report_id, request_render_id]):
         return jsonify({"error": "application_id, report_id, and render_id are required"}), 400
 
-    # Get token from Authorization header or use environment variable
+    # Get token from Authorization header (NOT from query string)
     auth_header = request.headers.get("Authorization")
     if auth_header and auth_header.startswith("Bearer "):
         token = auth_header[7:]  # Remove "Bearer " prefix
     else:
-        token = TOKEN
+        # If no Bearer token in header, check if token was mistakenly passed as query param
+        token = request.args.get("Authorization") or TOKEN
     
     if not token:
-        return jsonify({"error": "Authorization token is required"}), 401
+        return jsonify({"error": "Authorization token is required. Use Authorization header with Bearer prefix"}), 401
 
     logger.info(f"Request parameters: app_id={application_id}, report_id={report_id}, render_id={request_render_id}")
+    logger.info(f"Using token: {token[:20]}...")  
 
     # Check if already downloaded
     cached = already_downloaded(application_id, report_id, request_render_id=request_render_id)
