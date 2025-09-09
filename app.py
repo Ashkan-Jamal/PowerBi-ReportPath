@@ -95,8 +95,10 @@ def save_file_locally(file_url, file_name, token):
         if not os.path.abspath(local_path).startswith(os.path.abspath(STORAGE_PATH)):
             raise ValueError("Invalid file path")
         
-        headers = {"Authorization": f"Bearer {token}"}
-            
+headers = {
+    "Authorization": f"{token}",  # Just the token, no "Bearer"
+    "Accept": "application/json"
+}            
         response = requests.get(file_url, headers=headers, timeout=30, stream=True)
         response.raise_for_status()
         
