@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, redirect, send_file
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import requests
 import sqlite3
@@ -6,8 +6,6 @@ from datetime import datetime
 import os
 import logging
 from werkzeug.utils import secure_filename
-import json
-import time
 import shutil
 
 # ---------------- CONFIG ----------------
@@ -15,15 +13,15 @@ BASE_DOMAIN = os.getenv("BASE_DOMAIN", "https://omantracking2.com")
 TOKEN = os.getenv("TOKEN")
 DB_FILE = os.getenv("DB_FILE", "reports.db")
 STORAGE_PATH = os.getenv("STORAGE_PATH", "/opt/render/reports")
-
 os.makedirs(STORAGE_PATH, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
 CORS(app)
 
-# --- Database ---
+# ---------------- Database ----------------
 def init_db():
     """Initialize DB with simple schema"""
     try:
@@ -43,7 +41,7 @@ def init_db():
                 )
             """)
             conn.commit()
-        logger.info("Database initialized successfully")
+            logger.info("Database initialized successfully")
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
 
@@ -82,42 +80,31 @@ def save_to_db(application_id, report_id, request_render_id, api_render_id, file
     except Exception as e:
         logger.error(f"Error saving to DB: {e}")
 
-# --- File storage ---
+# ---------------- File Storage ----------------
 def save_file_locally(file_url, file_name, token):
     try:
-        # Ensure storage directory exists
         os.makedirs(STORAGE_PATH, exist_ok=True)
-        
         safe_filename = secure_filename(file_name)
         local_path = os.path.join(STORAGE_PATH, safe_filename)
-        
-        # Validate path security
         if not os.path.abspath(local_path).startswith(os.path.abspath(STORAGE_PATH)):
             raise ValueError("Invalid file path")
-        
-        # Always use API token as-is
-        headers = {
-            "Authorization": token,
-            "Accept": "application/json"
-        }
-        
+
+        headers = {"Authorization": token, "Accept": "application/json"}
         response = requests.get(file_url, headers=headers, timeout=30, stream=True)
         response.raise_for_status()
-        
-        # Write file
+
         temp_path = local_path + ".tmp"
         with open(temp_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
                     f.write(chunk)
-        
         shutil.move(temp_path, local_path)
         return local_path
     except Exception as e:
         logger.error(f"Failed to save locally: {e}")
         return None
 
-# --- Routes ---
+# ---------------- Routes ----------------
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({
@@ -138,24 +125,17 @@ def get_report():
     if not all([application_id, report_id, request_render_id]):
         return jsonify({"error": "application_id, report_id, and render_id are required"}), 400
 
-    # Get token from Authorization header (NOT from query string ideally)
-    auth_header = request.headers.get("Authorization")
-    if auth_header:
-        token = auth_header.strip()
-    else:
-        token = request.args.get("Authorization") or TOKEN
-    
+    token = request.headers.get("Authorization") or TOKEN
     if not token:
-        return jsonify({"error": "Authorization token is required. Pass it in the Authorization header"}), 401
+        return jsonify({"error": "Authorization token is required"}), 401
 
     logger.info(f"Request parameters: app_id={application_id}, report_id={report_id}, render_id={request_render_id}")
-    logger.info(f"Using token: {token[:20]}...")  
 
-    # Check if already downloaded
+    # 1️⃣ Check DB first
     cached = already_downloaded(application_id, report_id, request_render_id=request_render_id)
     if cached:
         return jsonify({
-            "message": "Report already processed",
+            "message": "Report retrieved from local cache",
             "application_id": application_id,
             "report_id": report_id,
             "render_id": request_render_id,
@@ -163,28 +143,19 @@ def get_report():
             "file_name": cached["file_name"]
         })
 
-    url = f"{BASE_DOMAIN}/comGpsGate/api.v.1/applications/{application_id}/reports/{report_id}/renderings/{request_render_id}"
-    headers = {
-        "Authorization": token,  # Always API token, no prefix
-        "Accept": "application/json",
-        "Content-Type": "application/json"
-    }
-
+    # 2️⃣ If not in DB, call API
+    url = f"{BASE_DOMAIN}/comGpsGate/api/v.1/applications/{application_id}/reports/{report_id}/renderings/{request_render_id}"
+    headers = {"Authorization": token, "Accept": "application/json", "Content-Type": "application/json"}
     try:
         logger.info(f"Calling GPSGate API with URL: {url}")
-        logger.info(f"Using token: {token[:20]}...")
         response = requests.get(url, headers=headers, timeout=30)
-        
         if response.status_code != 200:
             logger.error(f"GPSGate API error: {response.status_code} - {response.text}")
-            return jsonify({
-                "error": f"Error fetching render: {response.status_code}",
-                "details": response.text
-            }), response.status_code
+            return jsonify({"error": f"Error fetching render: {response.status_code}", "details": response.text}), response.status_code
 
         data = response.json()
         logger.info(f"API response: {data}")
-        
+
         api_render_id = data.get("id")
         output_file = data.get("outputFile")
         is_ready = data.get("isReady", False)
@@ -192,11 +163,11 @@ def get_report():
         if not api_render_id or not output_file:
             return jsonify({"error": "No report file info found in response"}), 404
 
-        # Check if this specific API render ID is already processed
+        # Check if API render ID is already in DB
         cached = already_downloaded(application_id, report_id, api_render_id=api_render_id)
         if cached:
             return jsonify({
-                "message": "Report already processed",
+                "message": "Report retrieved from local cache",
                 "application_id": application_id,
                 "report_id": report_id,
                 "render_id": api_render_id,
@@ -210,6 +181,7 @@ def get_report():
             file_path = save_file_locally(file_url, file_name, token)
             if not file_path:
                 return jsonify({"error": "Failed to save file"}), 500
+
             save_to_db(application_id, report_id, request_render_id, str(api_render_id), file_name, file_path)
             return jsonify({
                 "application_id": application_id,
@@ -238,21 +210,17 @@ def download_file(filename):
         filename = secure_filename(filename)
         if not filename:
             return jsonify({"error": "Invalid filename"}), 400
-            
         with sqlite3.connect(DB_FILE) as conn:
             cur = conn.cursor()
             cur.execute("SELECT file_path FROM downloaded_reports WHERE file_name=?", (filename,))
             row = cur.fetchone()
-            
             if row:
                 file_path = row[0]
-                
                 if os.path.exists(file_path):
                     return send_file(file_path, as_attachment=True)
                 else:
                     return jsonify({"error": "File not found on disk"}), 404
-                    
-        return jsonify({"error": "File not found in database"}), 404
+            return jsonify({"error": "File not found in database"}), 404
     except Exception as e:
         logger.error(f"Download error: {e}")
         return jsonify({"error": "Download failed"}), 500
