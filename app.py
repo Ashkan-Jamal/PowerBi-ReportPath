@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, redirect, send_file
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import requests
 import sqlite3
@@ -6,13 +6,12 @@ from datetime import datetime
 import os
 import logging
 from werkzeug.utils import secure_filename
-import json
-import time
 import shutil
 
 # ---------------- CONFIG ----------------
 BASE_DOMAIN = os.getenv("BASE_DOMAIN", "https://omantracking2.com")
 TOKEN = os.getenv("TOKEN")
+AUTH_SCHEME = os.getenv("AUTH_SCHEME", "Bearer")  # Can be "Bearer" or "token"
 DB_FILE = os.getenv("DB_FILE", "reports.db")
 STORAGE_PATH = os.getenv("STORAGE_PATH", "/opt/render/reports")
 
@@ -25,7 +24,6 @@ CORS(app)
 
 # --- Database ---
 def init_db():
-    """Initialize DB with simple schema"""
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cur = conn.cursor()
@@ -94,7 +92,7 @@ def save_file_locally(file_url, file_name, token):
             raise ValueError("Invalid file path")
 
         headers = {
-            "Authorization": f"token {token.strip()}",
+            "Authorization": f"{AUTH_SCHEME} {token.strip()}",
             "Accept": "application/json"
         }
 
@@ -134,10 +132,10 @@ def get_report():
     if not all([application_id, report_id, request_render_id]):
         return jsonify({"error": "application_id, report_id, and render_id are required"}), 400
 
-    # --- FIXED TOKEN EXTRACTION ---
+    # --- TOKEN EXTRACTION ---
     auth_header = request.headers.get("Authorization")
     if auth_header and auth_header.startswith("Bearer "):
-        token = auth_header[7:]  # strip Bearer
+        token = auth_header[7:]
     else:
         token = auth_header or request.args.get("Authorization") or TOKEN
 
@@ -145,7 +143,7 @@ def get_report():
         return jsonify({"error": "Authorization token is required"}), 401
 
     logger.info(f"Request parameters: app_id={application_id}, report_id={report_id}, render_id={request_render_id}")
-    logger.info(f"Using token: {token[:20]}...")
+    logger.info(f"Using token: {token[:20]}... with scheme {AUTH_SCHEME}")
 
     # --- DB check first ---
     cached = already_downloaded(application_id, report_id, request_render_id=request_render_id)
@@ -162,7 +160,7 @@ def get_report():
     # --- API call if not cached ---
     url = f"{BASE_DOMAIN}/comGpsGate/api/v.1/applications/{application_id}/reports/{report_id}/renderings/{request_render_id}"
     headers = {
-        "Authorization": f"token {token.strip()}",
+        "Authorization": f"{AUTH_SCHEME} {token.strip()}",
         "Accept": "application/json",
         "Content-Type": "application/json"
     }
@@ -220,7 +218,7 @@ def get_report():
             })
         else:
             return jsonify({
-                "message": "Report not ready yet", 
+                "message": "Report not ready yet",
                 "status": "processing",
                 "api_render_id": api_render_id
             })
