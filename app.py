@@ -94,7 +94,7 @@ def save_file_locally(file_url, file_name, token):
             raise ValueError("Invalid file path")
 
         headers = {
-            "Authorization": token,
+            "Authorization": f"token {token.strip()}",
             "Accept": "application/json"
         }
 
@@ -162,7 +162,7 @@ def get_report():
     # --- API call if not cached ---
     url = f"{BASE_DOMAIN}/comGpsGate/api/v.1/applications/{application_id}/reports/{report_id}/renderings/{request_render_id}"
     headers = {
-        "Authorization": token,
+        "Authorization": f"token {token.strip()}",
         "Accept": "application/json",
         "Content-Type": "application/json"
     }
