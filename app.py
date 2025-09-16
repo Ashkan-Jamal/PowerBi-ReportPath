@@ -236,40 +236,33 @@ def get_report():
         logger.error(f"Unexpected error: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
-@app.route("/download_file/<filename>", methods=["GET"])
-def download_file(filename):
+@app.route("/get_report", methods=["GET"])
+def get_report():
+    app_id = request.args.get("application_id")
+    report_id = request.args.get("report_id")
+    render_id = request.args.get("render_id")
+
+    if not all([app_id, report_id, render_id]):
+        return jsonify({"error": "application_id, report_id, render_id required"}), 400
+
+    # Use header token or fallback
+    token = request.headers.get("Authorization", TOKEN)
+    if not token:
+        return jsonify({"error": "Authorization token missing"}), 401
+    token = token.strip()
+
+    url = f"{BASE_DOMAIN.rstrip('/')}/comGpsGate/api.v.1/applications/{app_id}/reports/{report_id}/renderings/{render_id.strip()}"
+    headers = {"Authorization": token, "Accept": "application/json"}
+
     try:
-        filename = secure_filename(filename)
-        if not filename:
-            return jsonify({"error": "Invalid filename"}), 400
-            
-        with sqlite3.connect(DB_FILE) as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT file_path FROM downloaded_reports WHERE file_name=?", (filename,))
-            row = cur.fetchone()
-            
-            if row:
-                file_path = row[0]
-                
-                if os.path.exists(file_path):
-                    return send_file(file_path, as_attachment=True)
-                else:
-                    return jsonify({"error": "File not found on disk"}), 404
-                    
-        return jsonify({"error": "File not found in database"}), 404
-    except Exception as e:
-        logger.error(f"Download error: {e}")
-        return jsonify({"error": "Download failed"}), 500
+        resp = requests.get(url, headers=headers, timeout=30)
+        if resp.status_code != 200:
+            return jsonify({
+                "error": f"GPSGate API returned {resp.status_code}",
+                "details": resp.text
+            }), resp.status_code
 
-@app.route("/health", methods=["GET"])
-def health_check():
-    return jsonify({
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "db_file_exists": os.path.exists(DB_FILE),
-        "storage_path_exists": os.path.exists(STORAGE_PATH)
-    })
-
-if __name__ == "__main__":
-    init_db()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
+        data = resp.json()
+        return jsonify({"status": "success", "data": data})
+    except requests.RequestException as e:
+        return jsonify({"error": "Network/API error", "details": str(e)}), 500
